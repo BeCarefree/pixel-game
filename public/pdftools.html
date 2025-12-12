@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF 轉 PPTX/圖片 (自動去背)</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- PDF.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    
+    <!-- PptxGenJS -->
+    <script src="https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js"></script>
+
+    <!-- JSZip (新增) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+    <!-- FileSaver.js (新增) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <script>
+        // 設定 PDF.js Worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+
+    <style>
+        .drop-zone {
+            transition: all 0.3s ease;
+        }
+        .drop-zone.drag-over {
+            border-color: #3b82f6;
+            background-color: #eff6ff;
+        }
+        .loader {
+            border-top-color: #3498db;
+            -webkit-animation: spinner 1.5s linear infinite;
+            animation: spinner 1.5s linear infinite;
+        }
+        @keyframes spinner {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        function App() {
+            const [file, setFile] = useState(null);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [progress, setProgress] = useState(0);
+            const [statusText, setStatusText] = useState("");
+            const [previewImages, setPreviewImages] = useState([]);
+            const [processingType, setProcessingType] = useState(""); // 'pptx' or 'zip'
+            const [settings, setSettings] = useState({
+                removeBackground: true,
+                threshold: 240, // 0-255, 判定為白色的閾值
+                quality: 1.5 // 渲染解析度倍率
+            });
+
+            // 處理檔案拖放
+            const handleDrop = (e) => {
+                e.preventDefault();
+                const droppedFile = e.dataTransfer.files[0];
+                if (droppedFile && droppedFile.type === "application/pdf") {
+                    setFile(droppedFile);
+                    setPreviewImages([]);
+                    setProgress(0);
+                    setStatusText("檔案已就緒，請選擇轉換方式");
+                } else {
+                    alert("請上傳 PDF 檔案");
+                }
+            };
+
+            const handleFileSelect = (e) => {
+                const selectedFile = e.target.files[0];
+                if (selectedFile) {
+                    setFile(selectedFile);
+                    setPreviewImages([]);
+                    setProgress(0);
+                    setStatusText("檔案已就緒，請選擇轉換方式");
+                }
+            };
+
+            // 核心邏輯：去除白色背景
+            const removeWhiteBackground = (canvas, threshold) => {
+                const ctx = canvas.getContext('2d');
+                const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const data = imgData.data;
+
+                for (let i = 0; i < data.length; i += 4) {
+                    const r = data[i];
+                    const g = data[i + 1];
+                    const b = data[i + 2];
+                    
+                    // 如果 RGB 都大於閾值 (接近白色)，將 Alpha 設為 0 (透明)
+                    if (r > threshold && g > threshold && b > threshold) {
+                        data[i + 3] = 0;
+                    }
+                }
+                ctx.putImageData(imgData, 0, 0);
+                return canvas.toDataURL('image/png');
+            };
+
+            const processDocument = async (format) => {
+                if (!file) return;
+
+                setIsProcessing(true);
+                setProcessingType(format);
+                setPreviewImages([]);
+                setProgress(0);
+                
+                try {
+                    const arrayBuffer = await file.arrayBuffer();
+                    const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+                    const totalPages = pdf.numPages;
+                    
+                    setStatusText(`讀取到 ${totalPages} 頁，開始轉換為 ${format === 'pptx' ? 'PPTX' : '圖片包'}...`);
+
+                    // 初始化 PPTX 或 ZIP
+                    let pptx = null;
+                    let zip = null;
+                    
+                    if (format === 'pptx') {
+                        pptx = new PptxGenJS();
+                        pptx.layout = 'LAYOUT_16x9';
+                    } else if (format === 'zip') {
+                        zip = new JSZip();
+                    }
+
+                    const processedImages = [];
+                    const fileName = file.name.replace('.pdf', '');
+
+                    for (let i = 1; i <= totalPages; i++) {
+                        setStatusText(`正在處理第 ${i} / ${totalPages} 頁...`);
+                        setProgress(Math.round((i / totalPages) * 100));
+
+                        const page = await pdf.getPage(i);
+                        const viewport = page.getViewport({ scale: settings.quality });
+
+                        // 建立 Canvas 繪製 PDF
+                        const canvas = document.createElement('canvas');
+                        const context = canvas.getContext('2d');
+                        canvas.height = viewport.height;
+                        canvas.width = viewport.width;
+
+                        await page.render({
+                            canvasContext: context,
+                            viewport: viewport
+                        }).promise;
+
+                        let finalImageData;
+
+                        if (settings.removeBackground) {
+                            finalImageData = removeWhiteBackground(canvas, settings.threshold);
+                        } else {
+                            finalImageData = canvas.toDataURL('image/png');
+                        }
+
+                        // 為了避免記憶體過大，只保留前 3 頁做預覽
+                        if (i <= 3) {
+                            processedImages.push(finalImageData);
+                        }
+
+                        // 根據格式處理輸出
+                        if (format === 'pptx') {
+                            const slide = pptx.addSlide();
+                            slide.addImage({
+                                data: finalImageData,
+                                x: 0.5,
+                                y: 0.5,
+                                w: "90%",
+                                h: "90%",
+                                sizing: { type: "contain", w: "90%", h: "90%" }
+                            });
+                        } else if (format === 'zip') {
+                            // 去除 data:image/png;base64, 前綴以存入 zip
+                            const base64Data = finalImageData.replace(/^data:image\/(png|jpg);base64,/, "");
+                            const imageName = `${fileName}_page_${String(i).padStart(3, '0')}.png`;
+                            zip.file(imageName, base64Data, {base64: true});
+                        }
+                    }
+
+                    setPreviewImages(processedImages);
+                    setStatusText(`處理完成！正在打包並下載 ${format === 'pptx' ? 'PPTX' : 'ZIP'}...`);
+                    
+                    // 下載檔案
+                    if (format === 'pptx') {
+                        await pptx.writeFile({ fileName: `${fileName}_converted.pptx` });
+                    } else if (format === 'zip') {
+                        const content = await zip.generateAsync({type: "blob"});
+                        saveAs(content, `${fileName}_images.zip`);
+                    }
+                    
+                    setStatusText("下載完成！");
+
+                } catch (error) {
+                    console.error(error);
+                    setStatusText("發生錯誤：" + error.message);
+                } finally {
+                    setIsProcessing(false);
+                    setProcessingType("");
+                }
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col items-center py-12 px-4 sm:px-6 lg:px-8">
+                    <div className="max-w-3xl w-full space-y-8 bg-white p-10 rounded-xl shadow-lg">
+                        <div className="text-center">
+                            <h1 className="text-3xl font-extrabold text-gray-900">
+                                PDF 轉 PPTX / 圖片工具
+                            </h1>
+                            <p className="mt-2 text-sm text-gray-600">
+                                自動將 PDF 頁面轉為簡報或圖片包，並支援 <span className="font-bold text-blue-600">智慧去背</span> 功能。
+                            </p>
+                        </div>
+
+                        {/* 設定區域 */}
+                        <div className="bg-gray-50 p-4 rounded-lg border border-gray-200 text-sm">
+                            <div className="flex flex-col sm:flex-row justify-between gap-4">
+                                <label className="flex items-center space-x-2 cursor-pointer">
+                                    <input 
+                                        type="checkbox" 
+                                        checked={settings.removeBackground}
+                                        onChange={(e) => setSettings({...settings, removeBackground: e.target.checked})}
+                                        className="form-checkbox h-5 w-5 text-blue-600 rounded"
+                                    />
+                                    <span className="text-gray-700 font-medium">啟用背景透明化 (去背)</span>
+                                </label>
+                                
+                                {settings.removeBackground && (
+                                    <div className="flex items-center space-x-2">
+                                        <span className="text-gray-500">去背強度:</span>
+                                        <input 
+                                            type="range" 
+                                            min="200" 
+                                            max="255" 
+                                            value={settings.threshold}
+                                            onChange={(e) => setSettings({...settings, threshold: parseInt(e.target.value)})}
+                                            className="w-32"
+                                        />
+                                        <span className="text-xs text-gray-400">({settings.threshold})</span>
+                                    </div>
+                                )}
+                            </div>
+                            <p className="mt-2 text-xs text-gray-400">
+                                * 去背功能會將 PDF 中的純白色背景轉為透明，適合製作去背素材。
+                            </p>
+                        </div>
+
+                        {/* 上傳區域 */}
+                        <div 
+                            className={`drop-zone mt-8 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-md cursor-pointer
+                                ${file ? 'border-green-400 bg-green-50' : 'border-gray-300 hover:border-blue-400'}`}
+                            onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }}
+                            onDragLeave={(e) => { e.currentTarget.classList.remove('drag-over'); }}
+                            onDrop={handleDrop}
+                            onClick={() => document.getElementById('file-upload').click()}
+                        >
+                            <div className="space-y-1 text-center">
+                                <svg className={`mx-auto h-12 w-12 ${file ? 'text-green-500' : 'text-gray-400'}`} stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                                    <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                </svg>
+                                <div className="flex text-sm text-gray-600 justify-center">
+                                    <label htmlFor="file-upload" className="relative cursor-pointer bg-white rounded-md font-medium text-blue-600 hover:text-blue-500 focus-within:outline-none">
+                                        <span>{file ? file.name : "上傳 PDF 檔案"}</span>
+                                        <input id="file-upload" name="file-upload" type="file" className="sr-only" accept=".pdf" onChange={handleFileSelect} />
+                                    </label>
+                                    {!file && <p className="pl-1">或拖放至此</p>}
+                                </div>
+                                <p className="text-xs text-gray-500">
+                                    {file ? "點擊重新選擇" : "支援 PDF 格式"}
+                                </p>
+                            </div>
+                        </div>
+
+                        {/* 動作按鈕區域 (雙按鈕) */}
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-6">
+                            <button
+                                onClick={() => processDocument('pptx')}
+                                disabled={!file || isProcessing}
+                                className={`w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white transition-colors
+                                    ${(!file || isProcessing) ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'}`}
+                            >
+                                {isProcessing && processingType === 'pptx' ? (
+                                    <span className="flex items-center">
+                                        <div className="loader ease-linear rounded-full border-2 border-t-2 border-gray-200 h-4 w-4 mr-2"></div>
+                                        處理中... {progress}%
+                                    </span>
+                                ) : (
+                                    <>
+                                        <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                                        轉為簡報 (.pptx)
+                                    </>
+                                )}
+                            </button>
+
+                            <button
+                                onClick={() => processDocument('zip')}
+                                disabled={!file || isProcessing}
+                                className={`w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white transition-colors
+                                    ${(!file || isProcessing) ? 'bg-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 focus:ring-2 focus:ring-offset-2 focus:ring-green-500'}`}
+                            >
+                                {isProcessing && processingType === 'zip' ? (
+                                    <span className="flex items-center">
+                                        <div className="loader ease-linear rounded-full border-2 border-t-2 border-gray-200 h-4 w-4 mr-2"></div>
+                                        處理中... {progress}%
+                                    </span>
+                                ) : (
+                                    <>
+                                        <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                        轉為圖片包 (.zip)
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                        
+                        {statusText && (
+                            <div className={`text-center text-sm font-medium mt-2 ${statusText.includes('錯誤') ? 'text-red-500' : 'text-blue-600'}`}>
+                                {statusText}
+                            </div>
+                        )}
+
+                        {/* 預覽區域 */}
+                        {previewImages.length > 0 && (
+                            <div className="mt-8">
+                                <h3 className="text-lg leading-6 font-medium text-gray-900 mb-4">
+                                    轉換結果預覽 (前 3 頁)
+                                </h3>
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                    {previewImages.map((img, idx) => (
+                                        <div key={idx} className="relative aspect-w-16 aspect-h-9 bg-gray-200 rounded-lg overflow-hidden border border-gray-300">
+                                            {/* 顯示格狀背景以凸顯透明效果 */}
+                                            <div className="absolute inset-0" style={{
+                                                backgroundImage: 'linear-gradient(45deg, #ccc 25%, transparent 25%), linear-gradient(-45deg, #ccc 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #ccc 75%), linear-gradient(-45deg, transparent 75%, #ccc 75%)',
+                                                backgroundSize: '20px 20px',
+                                                backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px'
+                                            }}></div>
+                                            <img src={img} alt={`Slide ${idx + 1}`} className="relative object-contain w-full h-full z-10" />
+                                            <div className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white text-xs px-2 py-1">
+                                                Page {idx + 1}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
